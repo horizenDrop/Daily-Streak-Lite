@@ -14,7 +14,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForBaseVisibility(rpc, txHash, timeoutMs = 45_000) {
+async function waitForBaseVisibility(rpc, txHash, timeoutMs = 30_000) {
   const started = Date.now();
   let lastTx = null;
   let lastReceipt = null;
@@ -124,13 +124,14 @@ module.exports = async function handler(req, res) {
         return badRequest(res, 'Transaction must be on Base Mainnet');
       }
 
-      const eventData = parseCheckinEventFromReceipt(receipt, contractAddress);
+      const eventData = parseCheckinEventFromReceipt(receipt, contractAddress, expectedAddress);
       if (!eventData) {
-        return badRequest(res, 'CheckedIn event not found in transaction receipt');
-      }
-
-      if (expectedAddress && eventData.account !== expectedAddress) {
-        return badRequest(res, 'Transaction does not belong to connected wallet');
+        return badRequest(
+          res,
+          expectedAddress
+            ? 'No CheckedIn event for the connected wallet in this transaction'
+            : 'CheckedIn event not found in transaction receipt'
+        );
       }
 
       const profileId = `wallet:${eventData.account}`;

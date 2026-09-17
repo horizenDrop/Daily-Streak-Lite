@@ -1,4 +1,5 @@
-const { json, methodGuard, readBody } = require('./_lib/http');
+const { getClientIp, json, methodGuard, readBody, tooManyRequests } = require('./_lib/http');
+const { checkRateLimit } = require('./_lib/rate-limit');
 const analytics = require('./_lib/analytics-store');
 const { normalizeAddress } = require('./_lib/evm');
 const { verifyAppOrigin } = require('./_lib/app-origin');
@@ -43,6 +44,16 @@ module.exports = async function handler(req, res) {
         allowedHosts: origin.allowedHosts
       });
     }
+
+    // Public unauthenticated endpoint: cap how fast one source can write
+    // analytics records so it cannot be used to flood storage.
+    const rl = await checkRateLimit({
+      scope: 'webhook',
+      key: getClientIp(req),
+      limit: 120,
+      windowMs: 60 * 1000
+    });
+    if (!rl.allowed) return tooManyRequests(res, 'Too many webhook events', rl.retryAfterMs);
 
     const body = await readBody(req);
     const eventName = analytics.sanitizeEventName(inferWebhookEvent(req, body)) || 'base_webhook';

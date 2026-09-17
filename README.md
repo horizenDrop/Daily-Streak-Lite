@@ -29,6 +29,9 @@ One simple loop:
 - `ALLOWED_APP_HOSTS=daily-streak-lite.vercel.app` (optional allow-list for API host protection)
 - `BASE_RPC_URL=https://mainnet.base.org`
 - `CHECKIN_CONTRACT_ADDRESS=0x...` (deployed `DailyStreakLite` on Base Mainnet)
+- `ANALYTICS_ADMIN_TOKEN=...` (optional; `GET /api/analytics/state` only returns
+  wallet addresses, user agents and raw payloads when this token is sent as
+  `x-admin-token` or `Authorization: Bearer ...`. Without it the response is aggregated + redacted.)
 - `REDIS_URL=redis://...` or `REDIS_URL=rediss://...` (optional, for persistent storage)
   - Do not include extra quotes in Vercel value field.
 

@@ -3,9 +3,10 @@ import analyticsState from '../api/analytics/state.js';
 import analyticsTrack from '../api/analytics/track.js';
 import streakState from '../api/streak/state.js';
 import streakPrepare from '../api/streak/prepare.js';
+import webhook from '../api/webhook.js';
 
 function call(handler, { method = 'GET', body = {}, query = {}, headers = {} } = {}) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const req = { method, body, query, headers };
     const res = {
       statusCode: 200,
@@ -21,7 +22,12 @@ function call(handler, { method = 'GET', body = {}, query = {}, headers = {} } =
         resolve({ statusCode: this.statusCode, payload, headers: this.headers });
       }
     };
-    handler(req, res);
+
+    // Without this the promise never settles when a handler throws before it
+    // has written a response, and the smoke run hangs instead of failing.
+    Promise.resolve()
+      .then(() => handler(req, res))
+      .catch(reject);
   });
 }
 
@@ -53,6 +59,12 @@ async function main() {
   });
   assertOk(tracked, 'analytics/track');
 
+  const hooked = await call(webhook, {
+    method: 'POST',
+    body: { event: 'smoke_webhook', address: '0x2222222222222222222222222222222222222222' }
+  });
+  assertOk(hooked, 'webhook');
+
   const analytics = await call(analyticsState, {
     method: 'GET',
     query: { limit: 5 }
@@ -60,6 +72,26 @@ async function main() {
   assertOk(analytics, 'analytics/state');
   if (!analytics.payload.summary?.byEvent?.smoke_ping) {
     throw new Error('analytics event smoke_ping was not stored');
+  }
+  if (analytics.payload.redacted !== true) {
+    throw new Error('analytics/state must redact events without an admin token');
+  }
+  for (const event of analytics.payload.recent || []) {
+    if ('walletAddress' in event || 'payload' in event || 'userAgent' in event) {
+      throw new Error('analytics/state leaked per-user fields without an admin token');
+    }
+  }
+
+  process.env.ANALYTICS_ADMIN_TOKEN = 'smoke-admin-token';
+  const analyticsAdmin = await call(analyticsState, {
+    method: 'GET',
+    query: { limit: 5 },
+    headers: { 'x-admin-token': 'smoke-admin-token' }
+  });
+  delete process.env.ANALYTICS_ADMIN_TOKEN;
+  assertOk(analyticsAdmin, 'analytics/state admin');
+  if (analyticsAdmin.payload.redacted !== false) {
+    throw new Error('analytics/state must return full events for a valid admin token');
   }
 
   const before = await call(streakState, {

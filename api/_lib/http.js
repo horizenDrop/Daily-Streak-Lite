@@ -15,6 +15,14 @@ function tooManyRequests(res, message, retryAfterMs) {
 }
 
 async function readBody(req) {
+  if (Buffer.isBuffer(req.body)) {
+    try {
+      return JSON.parse(req.body.toString('utf8') || '{}');
+    } catch {
+      return {};
+    }
+  }
+
   if (req.body && typeof req.body === 'object') {
     return req.body;
   }
@@ -39,6 +47,12 @@ function methodGuard(req, res, expected) {
   return true;
 }
 
+function getClientIp(req) {
+  const forwarded = String(req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
+  const value = forwarded || String(req?.headers?.['x-real-ip'] || '').trim() || req?.socket?.remoteAddress || '';
+  return String(value).slice(0, 64) || 'unknown';
+}
+
 function getPlayerId(req, body) {
   const raw = (
     req.headers['x-player-id'] ||
@@ -54,6 +68,7 @@ function getPlayerId(req, body) {
 
 module.exports = {
   badRequest,
+  getClientIp,
   getPlayerId,
   json,
   methodGuard,

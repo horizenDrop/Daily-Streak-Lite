@@ -78,12 +78,23 @@ async function getRedisClient() {
     redisClientPromise = connectRedis(candidates);
   }
 
+  let client = null;
   try {
-    return await redisClientPromise;
+    client = await redisClientPromise;
   } catch {
     redisClientPromise = null;
     return null;
   }
+
+  // `reconnectStrategy: () => false` means a dropped socket never heals on its
+  // own. Without this check the cached promise would keep handing out a dead
+  // client and every store call would silently fall back to memory forever.
+  if (client && client.isOpen === false) {
+    redisClientPromise = null;
+    return null;
+  }
+
+  return client;
 }
 
 module.exports = {

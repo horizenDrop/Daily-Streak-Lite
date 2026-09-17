@@ -56,9 +56,12 @@ async function readOnchainStats(provider, contractAddress, account) {
   return normalizeStats(raw);
 }
 
-function parseCheckinEventFromReceipt(receipt, contractAddress) {
+function parseCheckinEventFromReceipt(receipt, contractAddress, expectedAccount = null) {
   const target = normalizeAddress(contractAddress);
   if (!target) return null;
+
+  const wanted = normalizeAddress(expectedAccount);
+  let firstMatch = null;
 
   for (const log of receipt?.logs || []) {
     if (normalizeAddress(log.address) !== target) continue;
@@ -74,22 +77,22 @@ function parseCheckinEventFromReceipt(receipt, contractAddress) {
     const account = normalizeAddress(parsed.args.account);
     if (!account) continue;
 
-    const streak = toNumber(parsed.args.streak, 0);
-    const totalCheckins = toNumber(parsed.args.totalCheckIns, 0);
-    const day = toNumber(parsed.args.day, 0);
-    const nextCheckInAt = toNumber(parsed.args.nextCheckInAt, 0);
-
-    return {
+    const event = {
       account,
-      streak,
-      totalCheckins,
-      day,
-      nextCheckInAt,
+      streak: toNumber(parsed.args.streak, 0),
+      totalCheckins: toNumber(parsed.args.totalCheckIns, 0),
+      day: toNumber(parsed.args.day, 0),
+      nextCheckInAt: toNumber(parsed.args.nextCheckInAt, 0),
       canCheckInNow: false
     };
+
+    // A batched wallet_sendCalls receipt can carry several CheckedIn logs, so
+    // prefer the one that belongs to the caller instead of the first one.
+    if (wanted && account === wanted) return event;
+    if (!firstMatch) firstMatch = event;
   }
 
-  return null;
+  return wanted ? null : firstMatch;
 }
 
 module.exports = {

@@ -1,3 +1,4 @@
+const storage = createSafeStorage();
 const playerId = ensurePlayerId();
 const CONNECTED_FLAG_KEY = 'daily_streak_wallet_connected';
 const LAST_ADDRESS_KEY = 'daily_streak_last_address';
@@ -48,12 +49,57 @@ function bindEvents() {
   }
 }
 
+// Mini apps run inside third-party webviews where localStorage can be blocked
+// and every access throws. A memory-backed fallback keeps the app usable
+// instead of failing the whole module on the first read.
+function createSafeStorage() {
+  const fallback = new Map();
+  let backend = null;
+  try {
+    const probe = '__daily_streak_probe__';
+    window.localStorage.setItem(probe, '1');
+    window.localStorage.removeItem(probe);
+    backend = window.localStorage;
+  } catch {
+    backend = null;
+  }
+
+  return {
+    getItem(key) {
+      if (!backend) return fallback.has(key) ? fallback.get(key) : null;
+      try {
+        return backend.getItem(key);
+      } catch {
+        return fallback.has(key) ? fallback.get(key) : null;
+      }
+    },
+    setItem(key, value) {
+      fallback.set(key, String(value));
+      if (!backend) return;
+      try {
+        backend.setItem(key, String(value));
+      } catch {
+        // keep the in-memory copy only
+      }
+    },
+    removeItem(key) {
+      fallback.delete(key);
+      if (!backend) return;
+      try {
+        backend.removeItem(key);
+      } catch {
+        // nothing else to do
+      }
+    }
+  };
+}
+
 function ensurePlayerId() {
   const key = 'daily_streak_player_id';
-  const existing = localStorage.getItem(key);
+  const existing = storage.getItem(key);
   if (existing) return existing;
   const generated = `p_${Math.random().toString(36).slice(2, 10)}`;
-  localStorage.setItem(key, generated);
+  storage.setItem(key, generated);
   return generated;
 }
 
@@ -105,7 +151,7 @@ async function autoConnectWallet() {
     await connectWalletInternal({ allowPrompt: false, source: 'auto' });
     if (state.address) return;
 
-    const connectedBefore = localStorage.getItem(CONNECTED_FLAG_KEY) === '1';
+    const connectedBefore = storage.getItem(CONNECTED_FLAG_KEY) === '1';
     if (connectedBefore || isBaseAppContext()) {
       await connectWalletInternal({ allowPrompt: true, source: 'auto-restore' });
     }
@@ -133,8 +179,8 @@ async function connectWalletInternal({ allowPrompt, source }) {
 
     state.address = String(address).toLowerCase();
     state.lastKnownAddress = state.address;
-    localStorage.setItem(CONNECTED_FLAG_KEY, '1');
-    localStorage.setItem(LAST_ADDRESS_KEY, state.address);
+    storage.setItem(CONNECTED_FLAG_KEY, '1');
+    storage.setItem(LAST_ADDRESS_KEY, state.address);
     renderState();
     refreshState({ silent: true });
     trackEvent('wallet_connected', { source });
@@ -252,19 +298,47 @@ async function runDailyCheckin() {
   }
 }
 
+const BASE_CHAIN_ID_HEX = '0x2105';
+const BASE_CHAIN_PARAMS = {
+  chainId: BASE_CHAIN_ID_HEX,
+  chainName: 'Base',
+  nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+  rpcUrls: ['https://mainnet.base.org'],
+  blockExplorerUrls: ['https://basescan.org']
+};
+
 async function ensureBaseMainnet() {
   if (!window.ethereum) throw new Error('Wallet provider not available');
-  const chainId = await window.ethereum.request({ method: 'eth_chainId' });
-  if (String(chainId).toLowerCase() === '0x2105') return;
+  if (await isOnBaseMainnet()) return;
 
   try {
     await window.ethereum.request({
       method: 'wallet_switchEthereumChain',
-      params: [{ chainId: '0x2105' }]
+      params: [{ chainId: BASE_CHAIN_ID_HEX }]
     });
   } catch (error) {
-    throw new Error(`Switch to Base Mainnet failed: ${error.message}`);
+    // 4902 = chain unknown to the wallet; offer to add it before giving up.
+    if (error?.code !== 4902) {
+      throw new Error(`Switch to Base Mainnet failed: ${error.message}`);
+    }
+    try {
+      await window.ethereum.request({
+        method: 'wallet_addEthereumChain',
+        params: [BASE_CHAIN_PARAMS]
+      });
+    } catch (addError) {
+      throw new Error(`Add Base Mainnet failed: ${addError.message}`);
+    }
   }
+
+  if (!(await isOnBaseMainnet())) {
+    throw new Error('Wallet is not on Base Mainnet');
+  }
+}
+
+async function isOnBaseMainnet() {
+  const chainId = await window.ethereum.request({ method: 'eth_chainId' });
+  return Number(chainId) === 8453;
 }
 
 async function sendCheckinTransaction(txRequest) {
@@ -291,13 +365,18 @@ async function sendCheckinTransaction(txRequest) {
     if (isUserRejectedError(error)) {
       throw new Error('User rejected transaction');
     }
+    // Only batch-send as a fallback for transport problems. Retrying a tx the
+    // chain already refused (no funds, revert) just prompts the user twice.
+    if (isTerminalTxError(error)) {
+      throw new Error(`Unable to submit onchain tx: ${error.message}`);
+    }
     try {
-      const callId = await window.ethereum.request({
+      const callResult = await window.ethereum.request({
         method: 'wallet_sendCalls',
         params: [
           {
             version: '1.0',
-            chainId: '0x2105',
+            chainId: BASE_CHAIN_ID_HEX,
             from: state.address,
             calls: [{
               to: txRequest.to,
@@ -307,8 +386,9 @@ async function sendCheckinTransaction(txRequest) {
           }
         ]
       });
-      if (!callId) throw new Error('wallet_sendCalls did not return id');
-      return { callId };
+      const normalizedCallId = normalizeCallId(callResult);
+      if (!normalizedCallId) throw new Error('wallet_sendCalls did not return id');
+      return { callId: normalizedCallId };
     } catch (fallbackError) {
       if (isUserRejectedError(fallbackError)) {
         throw new Error('User rejected transaction');
@@ -316,6 +396,31 @@ async function sendCheckinTransaction(txRequest) {
       throw new Error(`Unable to submit onchain tx: ${fallbackError?.message || error.message}`);
     }
   }
+}
+
+function normalizeCallId(value) {
+  if (!value) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object' && typeof value.id === 'string') return value.id;
+  return null;
+}
+
+// Wallets report receipt status as '0x1', '0x01' or (rarely) a number.
+function isSuccessStatus(status) {
+  if (status === null || status === undefined) return null;
+  if (typeof status === 'boolean') return status;
+  const numeric = Number(status);
+  if (!Number.isFinite(numeric)) return null;
+  return numeric === 1;
+}
+
+// EIP-5792 v1.0 reports 'CONFIRMED'; v2.0 reports a numeric code (200 = done).
+function isCallBundleFinal(status) {
+  if (status === null || status === undefined) return false;
+  const text = String(status).toUpperCase();
+  if (text === 'CONFIRMED' || text === 'SUCCESS') return true;
+  const numeric = Number(status);
+  return Number.isFinite(numeric) && numeric >= 200 && numeric < 300;
 }
 
 async function waitForTxReceipt(txHash, timeoutMs = 120_000) {
@@ -326,8 +431,9 @@ async function waitForTxReceipt(txHash, timeoutMs = 120_000) {
       params: [txHash]
     });
     if (receipt) {
-      if (receipt.status === '0x1') return receipt;
-      throw new Error('Transaction reverted');
+      const success = isSuccessStatus(receipt.status);
+      if (success === false) throw new Error('Transaction reverted');
+      return receipt;
     }
     await sleep(1_500);
   }
@@ -345,8 +451,13 @@ async function waitForCallTransactionHash(callId, timeoutMs = 120_000) {
     const receipts = status?.receipts || [];
     const lastReceipt = [...receipts].reverse().find((item) => item?.transactionHash || item?.txHash);
     const txHash = lastReceipt?.transactionHash || lastReceipt?.txHash || null;
-    const finalized = status?.status === 'CONFIRMED' || status?.status === 'confirmed';
-    if (finalized && txHash) return txHash;
+
+    if (txHash) {
+      if (isSuccessStatus(lastReceipt?.status) === false) {
+        throw new Error('Transaction reverted');
+      }
+      if (isCallBundleFinal(status?.status)) return txHash;
+    }
 
     await sleep(1_500);
   }
@@ -449,8 +560,8 @@ function onAccountsChanged(accounts) {
 
   state.address = String(address).toLowerCase();
   state.lastKnownAddress = state.address;
-  localStorage.setItem(CONNECTED_FLAG_KEY, '1');
-  localStorage.setItem(LAST_ADDRESS_KEY, state.address);
+  storage.setItem(CONNECTED_FLAG_KEY, '1');
+  storage.setItem(LAST_ADDRESS_KEY, state.address);
   trackEvent('wallet_changed', { address: short(state.address) });
   renderState();
   refreshState({ silent: true });
@@ -459,12 +570,12 @@ function onAccountsChanged(accounts) {
 function onDisconnect() {
   trackEvent('wallet_disconnected', {});
   state.address = null;
-  localStorage.removeItem(CONNECTED_FLAG_KEY);
+  storage.removeItem(CONNECTED_FLAG_KEY);
   renderState();
 }
 
 function getLastKnownAddress() {
-  const value = String(localStorage.getItem(LAST_ADDRESS_KEY) || '').trim().toLowerCase();
+  const value = String(storage.getItem(LAST_ADDRESS_KEY) || '').trim().toLowerCase();
   if (/^0x[a-f0-9]{40}$/.test(value)) return value;
   return null;
 }
@@ -475,11 +586,15 @@ function isBaseAppContext() {
 }
 
 function short(value) {
-  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+  const text = String(value || '');
+  if (text.length <= 12) return text || 'unknown';
+  return `${text.slice(0, 6)}...${text.slice(-4)}`;
 }
 
 function shortHash(value) {
-  return `${value.slice(0, 10)}...${value.slice(-6)}`;
+  const text = String(value || '');
+  if (text.length <= 18) return text || 'unknown';
+  return `${text.slice(0, 10)}...${text.slice(-6)}`;
 }
 
 function normalizeHexValue(value) {
@@ -490,6 +605,17 @@ function normalizeHexValue(value) {
     throw new Error('Invalid transaction value from prepare endpoint');
   }
   return normalized;
+}
+
+function isTerminalTxError(error) {
+  const message = String(error?.message || '').toLowerCase();
+  return (
+    message.includes('insufficient funds') ||
+    message.includes('exceeds balance') ||
+    message.includes('execution reverted') ||
+    message.includes('alreadycheckedintoday') ||
+    message.includes('nonce too low')
+  );
 }
 
 function isUserRejectedError(error) {
